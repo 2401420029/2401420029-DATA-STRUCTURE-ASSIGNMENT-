@@ -1,0 +1,698 @@
+"""
+hospital_opd.py
+
+Hospital Appointment & Triage System (console)
+Structures used:
+ - Singly Linked List for doctor schedules
+ - Circular Queue for routine appointment tokens
+ - Min Heap (priority queue) for emergency triage (lower severity => higher priority)
+ - Hash Table (chaining) for patient index
+ - Stack for undo log
+
+Run: python hospital_opd.py
+"""
+
+from dataclasses import dataclass
+from typing import Optional, Any, List, Dict, Tuple
+import heapq
+import time
+import itertools
+
+# ----------------------
+# Data Models / ADTs
+# ----------------------
+
+@dataclass
+class Patient:
+    id: int
+    name: str
+    age: int
+    history: List[str]  # simple list of strings
+
+@dataclass
+class Token:
+    tokenId: int
+    patientId: int
+    doctorId: int
+    slotId: Optional[int]  # slotId if booked, else None
+    type: str  # "ROUTINE" or "EMERGENCY"
+    timestamp: float
+
+# ----------------------
+# Singly Linked List for Doctor Schedule (slots)
+# ----------------------
+
+class SlotNode:
+    """Node for a doctor's slot linked list."""
+    def __init__(self, slotId: int, startTime: str, endTime: str, status: str = "FREE"):
+        self.slotId = slotId
+        self.startTime = startTime
+        self.endTime = endTime
+        self.status = status  # "FREE" or "BOOKED"
+        self.next: Optional['SlotNode'] = None
+
+class DoctorSchedule:
+    """Singly linked list per doctor."""
+
+    def __init__(self, doctorId: int, doctorName: str):
+        self.doctorId = doctorId
+        self.doctorName = doctorName
+        self.head: Optional[SlotNode] = None
+
+    def add_slot(self, slotId: int, startTime: str, endTime: str):
+        """Insert at end (maintain chronological order by caller).
+        Time: O(k) to traverse where k = slots per doctor. Space: O(1) per op.
+        """
+        node = SlotNode(slotId, startTime, endTime)
+        if not self.head:
+            self.head = node
+            return
+        cur = self.head
+        while cur.next:
+            cur = cur.next
+        cur.next = node
+
+    def cancel_slot(self, slotId: int) -> bool:
+        """Delete or mark FREE if booked; returns True if slot found.
+        Time: O(k)."""
+        prev = None
+        cur = self.head
+        while cur:
+            if cur.slotId == slotId:
+                # remove node from list
+                if prev:
+                    prev.next = cur.next
+                else:
+                    self.head = cur.next
+                return True
+            prev = cur
+            cur = cur.next
+        return False
+
+    def find_next_free(self) -> Optional[SlotNode]:
+        """Return first FREE slot node."""
+        cur = self.head
+        while cur:
+            if cur.status == "FREE":
+                return cur
+            cur = cur.next
+        return None
+
+    def mark_booked(self, slotId: int) -> bool:
+        cur = self.head
+        while cur:
+            if cur.slotId == slotId and cur.status == "FREE":
+                cur.status = "BOOKED"
+                return True
+            cur = cur.next
+        return False
+
+    def mark_free(self, slotId: int) -> bool:
+        cur = self.head
+        while cur:
+            if cur.slotId == slotId and cur.status == "BOOKED":
+                cur.status = "FREE"
+                return True
+            cur = cur.next
+        return False
+
+    def traverse(self) -> List[Tuple[int,str,str,str]]:
+        out = []
+        cur = self.head
+        while cur:
+            out.append((cur.slotId, cur.startTime, cur.endTime, cur.status))
+            cur = cur.next
+        return out
+
+# ----------------------
+# Circular Queue for Routine Appointments
+# ----------------------
+
+class CircularQueue:
+    """Simple dynamic circular queue for Token objects.
+
+    Implementation: uses a Python list of fixed capacity that can grow when full.
+    Enqueue/dequeue: average O(1) time. Space O(n).
+    """
+
+    def __init__(self, capacity: int = 50):
+        self.capacity = capacity
+        self.arr: List[Optional[Token]] = [None] * capacity
+        self.head = 0
+        self.tail = 0
+        self.size = 0
+
+    def _grow(self):
+        # double capacity
+        new_cap = self.capacity * 2
+        new_arr = [None] * new_cap
+        for i in range(self.size):
+            new_arr[i] = self.arr[(self.head + i) % self.capacity]
+        self.arr = new_arr
+        self.capacity = new_cap
+        self.head = 0
+        self.tail = self.size
+
+    def enqueue(self, token: Token):
+        if self.size == self.capacity:
+            self._grow()  # amortized O(1) per enqueue
+        self.arr[self.tail] = token
+        self.tail = (self.tail + 1) % self.capacity
+        self.size += 1
+
+    def dequeue(self) -> Optional[Token]:
+        if self.size == 0:
+            return None
+        token = self.arr[self.head]
+        self.arr[self.head] = None
+        self.head = (self.head + 1) % self.capacity
+        self.size -= 1
+        return token
+
+    def peek(self) -> Optional[Token]:
+        if self.size == 0:
+            return None
+        return self.arr[self.head]
+
+    def is_empty(self) -> bool:
+        return self.size == 0
+
+    def __len__(self):
+        return self.size
+
+# ----------------------
+# Min-Heap Priority Queue for Emergency Triage
+# ----------------------
+
+class EmergencyTriage:
+    """Min-heap where lower severity score => higher priority.
+
+    We'll store entries as (severityScore, counter, Token) to break ties using counter.
+    Insert/extract-min: O(log n) time.
+    """
+
+    def __init__(self):
+        self.heap: List[Tuple[int, int, Token]] = []
+        self._counter = itertools.count()
+
+    def insert(self, token: Token, severityScore: int):
+        cnt = next(self._counter)
+        heapq.heappush(self.heap, (severityScore, cnt, token))
+
+    def pop_min(self) -> Optional[Tuple[int, Token]]:
+        if not self.heap:
+            return None
+        severity, _, token = heapq.heappop(self.heap)
+        return severity, token
+
+    def peek_min(self) -> Optional[Tuple[int, Token]]:
+        if not self.heap:
+            return None
+        severity, _, token = self.heap[0]
+        return severity, token
+
+    def __len__(self):
+        return len(self.heap)
+
+# ----------------------
+# Hash Table (Chaining) for Patient Index
+# ----------------------
+
+class PatientHashTable:
+    """Simple chained hash table for Patients. Uses small bucket count by default.
+    Average insert/search O(1), worst-case O(n) if many collisions.
+    """
+
+    def __init__(self, buckets: int = 53):
+        self.buckets = buckets
+        self.table: List[List[Patient]] = [[] for _ in range(buckets)]
+
+    def _bucket_idx(self, patientId: int) -> int:
+        return patientId % self.buckets
+
+    def upsert(self, patient: Patient):
+        idx = self._bucket_idx(patient.id)
+        bucket = self.table[idx]
+        for i, p in enumerate(bucket):
+            if p.id == patient.id:
+                bucket[i] = patient
+                return
+        bucket.append(patient)
+
+    def get(self, patientId: int) -> Optional[Patient]:
+        idx = self._bucket_idx(patientId)
+        for p in self.table[idx]:
+            if p.id == patientId:
+                return p
+        return None
+
+    def delete(self, patientId: int) -> bool:
+        idx = self._bucket_idx(patientId)
+        bucket = self.table[idx]
+        for i, p in enumerate(bucket):
+            if p.id == patientId:
+                bucket.pop(i)
+                return True
+        return False
+
+    def all_patients(self) -> List[Patient]:
+        out = []
+        for bucket in self.table:
+            out.extend(bucket)
+        return out
+
+# ----------------------
+# Undo Stack
+# ----------------------
+
+class UndoStack:
+    """Stack storing actions to allow undo. Each action is a tuple describing what to reverse.
+    Example actions:
+      ("book", token, doctorId, slotId)
+      ("cancel", token)
+      ("serve", token)  -- serving from queue/triage
+      ("register", patientId)
+      ("patient_update", old_patient)
+    """
+
+    def __init__(self):
+        self.stack: List[Tuple[str, Any]] = []
+
+    def push(self, action: Tuple[str, Any]):
+        self.stack.append(action)
+
+    def pop(self) -> Optional[Tuple[str, Any]]:
+        if not self.stack:
+            return None
+        return self.stack.pop()
+
+    def is_empty(self) -> bool:
+        return len(self.stack) == 0
+
+# ----------------------
+# Central OPD System
+# ----------------------
+
+class OPDSystem:
+    def __init__(self):
+        # containers
+        self.patients = PatientHashTable()
+        self.doctor_schedules: Dict[int, DoctorSchedule] = {}
+        self.routine_queue = CircularQueue(capacity=50)
+        self.triage = EmergencyTriage()
+        self.undo_log = UndoStack()
+
+        # token generation
+        self._token_counter = itertools.count(1)
+
+        # stats
+        self.served_count = 0
+        self.pending_count = 0
+        self.token_store: Dict[int, Token] = {}  # tokenId -> Token
+        self.patient_visit_count: Dict[int, int] = {}  # for top-K frequent
+
+    # ------------------
+    # Patient CRUD
+    # ------------------
+    def patient_upsert(self, patient: Patient):
+        """Insert or update patient. Average T: O(1)."""
+        old = self.patients.get(patient.id)
+        if old:
+            # store old for undo
+            self.undo_log.push(("patient_update", old))
+        else:
+            self.undo_log.push(("register", patient.id))
+        self.patients.upsert(patient)
+
+    def patient_get(self, patientId: int) -> Optional[Patient]:
+        return self.patients.get(patientId)
+
+    def patient_delete(self, patientId: int):
+        old = self.patients.get(patientId)
+        if old:
+            self.patients.delete(patientId)
+            self.undo_log.push(("patient_delete", old))
+            return True
+        return False
+
+    # ------------------
+    # Doctor schedule ops
+    # ------------------
+    def add_doctor(self, doctorId: int, doctorName: str):
+        if doctorId in self.doctor_schedules:
+            return False
+        self.doctor_schedules[doctorId] = DoctorSchedule(doctorId, doctorName)
+        return True
+
+    def schedule_add_slot(self, doctorId: int, slotId: int, startTime: str, endTime: str):
+        ds = self.doctor_schedules.get(doctorId)
+        if not ds:
+            return False
+        ds.add_slot(slotId, startTime, endTime)
+        self.undo_log.push(("add_slot", (doctorId, slotId)))
+        return True
+
+    def schedule_cancel(self, doctorId: int, slotId: int) -> bool:
+        ds = self.doctor_schedules.get(doctorId)
+        if not ds:
+            return False
+        # we will attempt to mark free or remove; for simplicity, remove node
+        # capture current slot data for undo
+        cur = ds.head
+        prev = None
+        while cur:
+            if cur.slotId == slotId:
+                slot_copy = SlotNode(cur.slotId, cur.startTime, cur.endTime, cur.status)
+                # remove
+                if prev:
+                    prev.next = cur.next
+                else:
+                    ds.head = cur.next
+                self.undo_log.push(("cancel_slot", (doctorId, slot_copy)))
+                return True
+            prev = cur
+            cur = cur.next
+        return False
+
+    # ------------------
+    # Booking / Queueing
+    # ------------------
+    def enqueue_routine(self, patientId: int, doctorId: int, slotId: Optional[int] = None) -> Optional[Token]:
+        """Add routine appointment token. T: O(1) amortized. Returns Token."""
+        if self.patients.get(patientId) is None:
+            return None
+        tokenId = next(self._token_counter)
+        token = Token(tokenId, patientId, doctorId, slotId, "ROUTINE", time.time())
+        self.routine_queue.enqueue(token)
+        self.token_store[tokenId] = token
+        self.pending_count += 1
+        # track frequent
+        self.patient_visit_count[patientId] = self.patient_visit_count.get(patientId, 0)
+        # push undo
+        self.undo_log.push(("enqueue_routine", token))
+        return token
+
+    def triage_insert(self, patientId: int, severityScore: int) -> Optional[Token]:
+        """Insert emergency token into triage. Lower severityScore -> higher priority."""
+        if self.patients.get(patientId) is None:
+            return None
+        tokenId = next(self._token_counter)
+        token = Token(tokenId, patientId, doctorId=-1, slotId=None, type="EMERGENCY", timestamp=time.time())
+        self.triage.insert(token, severityScore)
+        self.token_store[tokenId] = token
+        self.pending_count += 1
+        # undo
+        self.undo_log.push(("triage_insert", (token, severityScore)))
+        return token
+
+    def serve_next(self) -> Optional[Token]:
+        """Serve from triage if not empty; otherwise from routine queue.
+        Extracting from triage O(log n); from queue O(1).
+        """
+        served_token = None
+        if len(self.triage) > 0:
+            # emergency takes precedence
+            severity, token = self.triage.pop_min()
+            served_token = token
+            source = "triage"
+        else:
+            token = self.routine_queue.dequeue()
+            if token:
+                served_token = token
+                source = "routine"
+            else:
+                return None
+
+        # mark stats and push undo
+        self.served_count += 1
+        self.pending_count = max(0, self.pending_count - 1)
+        # record visit freq
+        self.patient_visit_count[served_token.patientId] = self.patient_visit_count.get(served_token.patientId, 0) + 1
+        self.undo_log.push(("serve", (served_token, source)))
+        return served_token
+
+    # ------------------
+    # Undo logic
+    # ------------------
+    def undo_pop(self) -> str:
+        entry = self.undo_log.pop()
+        if not entry:
+            return "Nothing to undo."
+
+        action, data = entry
+        if action == "enqueue_routine":
+            token: Token = data
+            # We need to remove token from queue if present.
+            # Simple approach: regenerate new queue excluding that token.
+            newq = CircularQueue(max(50, self.routine_queue.capacity))
+            removed = False
+            while not self.routine_queue.is_empty():
+                t = self.routine_queue.dequeue()
+                if t and t.tokenId == token.tokenId:
+                    removed = True
+                    continue
+                if t:
+                    newq.enqueue(t)
+            # replace
+            self.routine_queue = newq
+            if removed:
+                self.pending_count = max(0, self.pending_count - 1)
+                self.token_store.pop(token.tokenId, None)
+                return f"Undo: removed routine booking token {token.tokenId}."
+            return "Undo: token not found in routine queue."
+
+        elif action == "triage_insert":
+            token, severity = data
+            # Remove token from heap by rebuilding heap excluding it
+            new_heap_entries = []
+            removed = False
+            while len(self.triage) > 0:
+                entry = heapq.heappop(self.triage.heap)
+                if entry[2].tokenId == token.tokenId:
+                    removed = True
+                    continue
+                new_heap_entries.append(entry)
+            self.triage.heap = new_heap_entries
+            heapq.heapify(self.triage.heap)
+            if removed:
+                self.pending_count = max(0, self.pending_count - 1)
+                self.token_store.pop(token.tokenId, None)
+                return f"Undo: removed emergency token {token.tokenId}."
+            return "Undo: token not found in triage."
+
+        elif action == "serve":
+            served_token, source = data
+            # Revert serve: put back into source (triage or routine)
+            if source == "triage":
+                # we don't have severity in action; for simplicity push with default severity 0
+                self.triage.insert(served_token, severityScore=0)
+            else:
+                self.routine_queue.enqueue(served_token)
+            self.served_count = max(0, self.served_count - 1)
+            self.pending_count += 1
+            # decrement visit count
+            self.patient_visit_count[served_token.patientId] = max(0, self.patient_visit_count.get(served_token.patientId, 1) - 1)
+            return f"Undo: put back served token {served_token.tokenId} into {source}."
+
+        elif action == "add_slot":
+            doctorId, slotId = data
+            ds = self.doctor_schedules.get(doctorId)
+            if ds:
+                ds.cancel_slot(slotId)
+                return f"Undo: removed added slot {slotId} for doctor {doctorId}."
+            return "Undo failed: doctor not found."
+
+        elif action == "cancel_slot":
+            doctorId, slot_copy = data
+            ds = self.doctor_schedules.get(doctorId)
+            if ds:
+                # re-add slot (at end)
+                ds.add_slot(slot_copy.slotId, slot_copy.startTime, slot_copy.endTime)
+                # set status if was BOOKED
+                if slot_copy.status == "BOOKED":
+                    ds.mark_booked(slot_copy.slotId)
+                return f"Undo: re-added slot {slot_copy.slotId} for doctor {doctorId}."
+            return "Undo failed: doctor not found."
+
+        elif action == "patient_update":
+            old_patient: Patient = data
+            self.patients.upsert(old_patient)
+            return f"Undo: restored patient {old_patient.id}."
+
+        elif action == "register":
+            pid = data
+            self.patients.delete(pid)
+            return f"Undo: removed patient {pid}."
+
+        elif action == "patient_delete":
+            old_patient: Patient = data
+            self.patients.upsert(old_patient)
+            return f"Undo: restored deleted patient {old_patient.id}."
+
+        else:
+            return f"Unknown undo action: {action}"
+
+    # ------------------
+    # Reports
+    # ------------------
+    def report_doctor_pending(self) -> Dict[int, Dict[str, Any]]:
+        """Return per doctor pending count & next slot. T: O(D*k) where D doctors, k slots each."""
+        out = {}
+        for did, ds in self.doctor_schedules.items():
+            next_slot = ds.find_next_free()
+            # count routine tokens for this doctor in queue
+            count = 0
+            # traverse queue to count tokens assigned to this doctor
+            temp = []
+            while not self.routine_queue.is_empty():
+                t = self.routine_queue.dequeue()
+                if t:
+                    temp.append(t)
+                    if t.doctorId == did:
+                        count += 1
+            # restore queue
+            for t in temp:
+                self.routine_queue.enqueue(t)
+            out[did] = {
+                "doctorName": ds.doctorName,
+                "pending_count": count,
+                "next_slot": (next_slot.slotId if next_slot else None)
+            }
+        return out
+
+    def report_served_vs_pending(self) -> Dict[str, int]:
+        return {"served": self.served_count, "pending": self.pending_count}
+
+    def top_k_frequent_patients(self, k: int = 5) -> List[Tuple[int,int]]:
+        items = list(self.patient_visit_count.items())
+        items.sort(key=lambda x: x[1], reverse=True)
+        return items[:k]
+
+# ----------------------
+# CLI helper
+# ----------------------
+
+def sample_data(opd: OPDSystem):
+    # add a couple of doctors and slots
+    opd.add_doctor(1, "Dr. A")
+    opd.schedule_add_slot(1, 101, "09:00", "09:15")
+    opd.schedule_add_slot(1, 102, "09:15", "09:30")
+    opd.add_doctor(2, "Dr. B")
+    opd.schedule_add_slot(2, 201, "09:00", "09:20")
+    opd.schedule_add_slot(2, 202, "09:20", "09:40")
+    # Add patients
+    opd.patient_upsert(Patient(1, "Alice", 30, []))
+    opd.patient_upsert(Patient(2, "Bob", 25, []))
+    opd.patient_upsert(Patient(3, "Charlie", 40, []))
+
+def print_menu():
+    print("\n=== OPD System Menu ===")
+    print("1. Register / Update Patient")
+    print("2. Book Routine Slot (enqueue)")
+    print("3. Emergency In (triage insert)")
+    print("4. Serve Next")
+    print("5. Undo Last Action")
+    print("6. Reports")
+    print("7. Show Doctor Schedules")
+    print("8. Exit")
+
+def main():
+    opd = OPDSystem()
+    sample_data(opd)
+    print("Sample data loaded (3 patients, 2 doctors with slots).")
+
+    while True:
+        print_menu()
+        choice = input("Choice: ").strip()
+        if choice == "1":
+            try:
+                pid = int(input("Patient ID (int): "))
+                name = input("Name: ")
+                age = int(input("Age: "))
+                opd.patient_upsert(Patient(pid, name, age, []))
+                print("Patient registered/updated.")
+            except Exception as e:
+                print("Invalid input:", e)
+
+        elif choice == "2":
+            try:
+                pid = int(input("Patient ID: "))
+                docid = int(input("Doctor ID: "))
+                ds = opd.doctor_schedules.get(docid)
+                if not ds:
+                    print("Doctor not found.")
+                    continue
+                next_slot = ds.find_next_free()
+                if not next_slot:
+                    print("No free slots for this doctor.")
+                    continue
+                # book: mark slot booked and enqueue token
+                booked = ds.mark_booked(next_slot.slotId)
+                if booked:
+                    token = opd.enqueue_routine(pid, docid, slotId=next_slot.slotId)
+                    print(f"Booked slot {next_slot.slotId} and enqueued token {token.tokenId}.")
+                else:
+                    print("Failed to book slot (might already be booked).")
+            except Exception as e:
+                print("Error:", e)
+
+        elif choice == "3":
+            try:
+                pid = int(input("Patient ID: "))
+                sev = int(input("Severity score (lower = more urgent): "))
+                token = opd.triage_insert(pid, sev)
+                if token:
+                    print(f"Emergency token created: {token.tokenId}")
+                else:
+                    print("Patient not registered.")
+            except Exception as e:
+                print("Invalid input:", e)
+
+        elif choice == "4":
+            served = opd.serve_next()
+            if served:
+                p = opd.patient_get(served.patientId)
+                pname = p.name if p else "Unknown"
+                print(f"Served token {served.tokenId} - Patient {pname} (id {served.patientId}) Type: {served.type}")
+            else:
+                print("No patients to serve.")
+
+        elif choice == "5":
+            result = opd.undo_pop()
+            print(result)
+
+        elif choice == "6":
+            print("1. Per-doctor pending & next slot")
+            print("2. Served vs Pending")
+            print("3. Top-K frequent patients")
+            sub = input("Report choice: ").strip()
+            if sub == "1":
+                rpt = opd.report_doctor_pending()
+                for did, info in rpt.items():
+                    print(f"Doctor {did} - {info['doctorName']}: Pending {info['pending_count']}, Next slot {info['next_slot']}")
+            elif sub == "2":
+                print(opd.report_served_vs_pending())
+            elif sub == "3":
+                k = int(input("K: "))
+                topk = opd.top_k_frequent_patients(k)
+                for pid, cnt in topk:
+                    p = opd.patient_get(pid)
+                    print(f"{p.name if p else pid}: {cnt} visits")
+            else:
+                print("Invalid choice.")
+
+        elif choice == "7":
+            for did, ds in opd.doctor_schedules.items():
+                print(f"\nDoctor {did} - {ds.doctorName}")
+                for slot in ds.traverse():
+                    print(f"  Slot {slot[0]} {slot[1]}-{slot[2]} : {slot[3]}")
+
+        elif choice == "8":
+            print("Exiting.")
+            break
+
+        else:
+            print("Unknown choice. Try again.")
+
+if __name__ == "__main__":
+    main()
